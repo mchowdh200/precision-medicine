@@ -1,9 +1,16 @@
+import math
 import random
+from itertools import combinations
 from pprint import pprint
 from typing import Container, Iterable, Mapping, Tuple
 
 import numpy as np
 import tensorflow as tf
+from tensorflow._api.v2.data import AUTOTUNE
+
+
+def nchoosek(n: int, k: int) -> int:
+    return int(math.factorial(n) / (math.factorial(k) * math.factorial(n - k)))
 
 
 def get_sample_names(filename: str) -> list[str]:
@@ -148,9 +155,117 @@ class PairsDataset:
         self.ds = self.ds.batch(batch_size).prefetch(10)
 
 
+def load_genotypes_unsupervised(
+    filename: str, keep_samples: Container[str]
+) -> list[list[np.uint8]]:
+    """
+    Just loads a list of genotypes (encoded as int8).  No sample names.
+    Each line consists of sample then genotype vector (tab separated).
+    So we need to filter out the samples we don't want.
+    """
+
+    def is_keep_sample(keep_list: Container[str], sample_line: str):
+        return sample_line.split()[0] in keep_list
+
+    with open(filename, "r") as f:
+        genotypes = [
+            line.rstrip().split()[1:]
+            for line in f.read().splitlines()
+            if is_keep_sample(keep_samples, line)
+        ]  # string of ints with no delimiter
+    return [[np.uint8(i) for i in list(g)] for g in genotypes]
+
+
+class PairsDatasetUnsupervised:
+    def __init__(
+        self,
+        sample_id_filename: str,
+        genotype_filename: str,
+        shuffle: bool = False,
+        encoding_type: tf.DType = tf.int8,
+        batch_size: int = 32,
+        repeat: bool = False,
+    ):
+        """
+        TF dataset for the sample pairs without targets
+        """
+        keep_samples = get_sample_names(sample_id_filename)
+        genotypes = load_genotypes_unsupervised(genotype_filename, keep_samples)
+
+        self.num_pairs = nchoosek(len(genotypes), 2) // batch_size
+        self.num_variants = len(genotypes[0])
+
+        if shuffle:
+            generator = lambda: combinations(
+                random.sample(genotypes, len(genotypes)), 2
+            )
+        else:
+            generator = lambda: combinations(genotypes, 2)
+
+        self.ds = tf.data.Dataset.from_generator(
+            generator,
+            (encoding_type, encoding_type),
+            (
+                tf.TensorShape([self.num_variants]),
+                tf.TensorShape([self.num_variants]),
+            ),
+        )
+        if repeat:
+            self.ds = self.ds.repeat()
+        self.ds = self.ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+class SingleDataset:
+    def __init__(
+        self,
+        sample_id_filename: str,
+        genotype_filename: str,
+        shuffle: bool = False,
+        batch_size: int = 32,
+        repeat: bool = True,
+    ):
+        """
+        TF dataset for single samples.
+        Each element is a tuple of (sample_id, genotype_vector)
+        """
+        keep_samples = get_sample_names(sample_id_filename)
+        with open(genotype_filename, "r") as f:
+            genotypes = [
+                (line.split()[0], [float(x) for x in line.rstrip().split()[1:]])
+                for line in f.read().splitlines()
+                if line.split()[0] in keep_samples
+            ]
+
+        # create dataset that yeilds tuples of (sample_id, genotype_vector)
+        sample_ds = tf.data.Dataset.from_tensor_slices([g[0] for g in genotypes])
+        genotype_ds = tf.data.Dataset.from_tensor_slices([g[1] for g in genotypes])
+        self.ds = tf.data.Dataset.zip((sample_ds, genotype_ds))
+
+        self.num_variants = len(genotypes[0])
+        # self.ds = tf.data.Dataset.from_tensor_slices(data)
+        if repeat:
+            self.ds = self.ds.repeat()
+        if shuffle:
+            self.ds = self.ds.shuffle(buffer_size=len(genotypes))
+        self.ds = self.ds.batch(batch_size).prefetch(10)
+
 
 if __name__ == "__main__":
-    sample_ids = load_sample_ids("/home/murad/data/toy_model_data/ALL.sampleIDs")
-    genotypes = load_genotypes("/home/murad/data/toy_model_data/chr0.seg.0.encoding")
-    sample_pairs = get_sample_pairs("/home/murad/data/toy_model_data/chr0.seg.0.cnn")
-    pprint(sample_pairs)
+    train_samples = "/home/murad/data/toy_model_data/new_model/training.samples"
+    sample_id_filename = "/home/murad/data/toy_model_data/new_model/all.samples"
+    genotype_filename = (
+        "/home/murad/data/toy_model_data/new_model/chr8-30x.seg.86.encoded"
+    )
+    batch_size = 128
+
+    train_ds = PairsDatasetUnsupervised(
+        sample_id_filename=train_samples,
+        genotype_filename=genotype_filename,
+        shuffle=True,
+        repeat=False,
+        batch_size=batch_size,
+    )
+    print(train_ds.num_pairs)
+
+    for i, (s1, s2) in enumerate(train_ds.ds):
+        print(i, s1.shape, s2.shape)

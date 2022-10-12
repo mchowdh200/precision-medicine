@@ -1,5 +1,6 @@
 import tensorflow as tf
 
+
 def conv1d_block(
     inputs: tf.Tensor,
     filters: int,
@@ -141,9 +142,10 @@ class SiameseModel(tf.keras.Model):
     Wraps siamese network for training
     """
 
-    def __init__(self, siamese_network):
+    def __init__(self, base_model: tf.keras.Model, vector_size: int):
         super(SiameseModel, self).__init__()
-        self.siamese_network = siamese_network
+        self.base_model = base_model  # keep reference to base model so we can save it
+        self.siamese_network = build_siamese_network(self.base_model, vector_size)
         self.loss_tracker = tf.keras.metrics.Mean(name="loss")
 
     def call(self, data):
@@ -187,3 +189,98 @@ class SiameseModel(tf.keras.Model):
     @property
     def metrics(self):
         return [self.loss_tracker]
+
+    def save(self, *args, **kwargs):
+        """
+        Custom save method to only save the base model.
+        """
+        self.base_model.save(*args, **kwargs)
+
+
+class SiameseNN(tf.keras.Model):
+    """
+    Build siamese network with simSiam style architecture
+    """
+
+    def __init__(
+        self,
+        input_dim: tuple[int, int],  # length, channels
+        embedding_dim: int,
+        activation: str = "relu",
+        n_residual_blocks: int = 3,  # number of res blocks in base model
+        n_dense_blocks: int = 1,  # number of dense layers in base model
+    ):
+        super(SiameseNN, self).__init__()
+
+        self.input_dim = input_dim
+        self.embedding_dim = embedding_dim
+        self.activation = activation
+
+        self.base_model = resnet_model(
+            shape=input_dim,
+            activation=activation,
+            n_residual_blocks=n_residual_blocks,
+            n_dense_blocks=n_dense_blocks,
+        )
+        self.siamese_network = self._build_siamese_network()
+        self.loss_tracker = tf.keras.metrics.Mean(name="loss")
+
+    # TODO implement method to build siamese network
+    def _build_siamese_network(self):
+        """
+        Builds siamese network
+        :param vector_size: size of the sample inputs
+        :return: siamese network with two inputs (s1, s2) and one output (predicted distance)
+        """
+
+        # TODO allow general input shape tuple
+        in1 = tf.keras.Input(name="sample1", shape=self.input_dim[0])
+        in2 = tf.keras.Input(name="sample2", shape=self.input_dim[0])
+
+        # Compute embeddings. Only track the gradient through 1 leg of the network
+        x1 = self.base_model(in1)
+        # x2 = tf.stop_gradient(self.base_model(in2))
+        x2 = self.base_model(in2)
+
+        pred_sim = tf.keras.layers.Dot(axes=-1, normalize=True)([x1, x2])
+        siamese_network = tf.keras.Model(inputs=[in1, in2], outputs=pred_sim)
+        return siamese_network
+
+    def call(self, data):
+        return self.siamese_network(data)
+
+    def train_step(self, data):
+        with tf.GradientTape() as tape:
+            loss = self._compute_loss(data)
+        gradients = tape.gradient(loss, self.siamese_network.trainable_weights)
+        self.optimizer.apply_gradients(
+            zip(gradients, self.siamese_network.trainable_weights)
+        )
+        self.loss_tracker.update_state(loss)
+        return {"loss": self.loss_tracker.result()}
+
+
+    def test_step(self, data):
+        loss = self._compute_loss(data)
+        self.loss_tracker.update_state(loss)
+        return {"loss": self.loss_tracker.result()}
+
+    def _compute_loss(self, data):
+        pred_sim = self.call(data)
+
+        # we are using the full dimension similarity as
+        # the ground truth, and computing it on the fly
+        true_sim = tf.stop_gradient(
+            tf.keras.layers.Dot(axes=-1, normalize=True)([data[0], data[1]])
+        )
+        return tf.keras.losses.MSE(true_sim, pred_sim)
+
+    @property
+    def metrics(self):
+        return [self.loss_tracker]
+
+    def save(self, *args, **kwargs):
+        """
+        Custom save method to only save the base model.
+        """
+        self.base_model.save(*args, **kwargs)
